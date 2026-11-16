@@ -1,10 +1,16 @@
 import { z } from "zod";
+import {
+  RUST_PRODUCER_DEFAULTS,
+  rustProducerLimitsField,
+} from "./rustResourceLimits.js";
+import { analysisParameterLimitSchema } from "../analysisSettingDefinitions.js";
+import { producerLimitControl } from "../producerResourceLimits.js";
 import { digestSchema } from "../digests.js";
 import {
   absoluteLocalPathStringSchema,
   localPathStringSchema,
 } from "../localPath.js";
-import { BINARY_ARCHITECTURES } from "../binaryTargetTypes.js";
+import { binaryMetadataArchitecture } from "../binaryMetadataArchitecture.js";
 import {
   machoSelectionContainsRange,
   selectedSliceAgreesWithReport,
@@ -12,25 +18,14 @@ import {
   machoTargetSelectionSchema,
 } from "../apple/machoTargetSelection.js";
 
-/** Preserve the format owner's architecture spelling separately from Evidence vocabulary. */
-export const rustArchitectureForSubject = (architecture: string) => {
-  switch (architecture) {
-    case "386":
-      return "x86";
-    case "amd64":
-      return "x86_64";
-    default:
-      return BINARY_ARCHITECTURES.find(
-        (supported) => supported === architecture,
-      );
-  }
-};
-
 /** Known revisions used to interpret compatible cargo-auditable documents. */
 export const RUST_AUDITABLE_FORMAT_VERSIONS = [0, 1, 8] as const;
+/** Default compiler-path retention; callers can select a larger bounded prefix. */
+export const DEFAULT_RUSTC_HASH_LIMIT = 64;
 
 const index = z.int().nonnegative();
 const rustcHash = z.string().regex(/^[0-9a-f]{40}$/u);
+export const rustPackageFeaturesSchema = z.array(z.string().min(1)).nullable();
 
 /** One embedded package, with omitted kind and root preserved as null and false. */
 export const rustPackageSchema = z.strictObject({
@@ -39,6 +34,7 @@ export const rustPackageSchema = z.strictObject({
   source: z.string().min(1),
   kind: z.enum(["runtime", "build"]).nullable(),
   dependencies: z.array(index),
+  features: rustPackageFeaturesSchema.default(null),
   root: z.boolean(),
 });
 
@@ -51,7 +47,9 @@ const dependencyEdgeSchema = z.strictObject({
 export const rustAuditableMetadataSchema = z.strictObject({
   section_name: z.enum([".dep-v0", "__DATA,.dep-v0"]),
   file_offset: index,
+  /** Stored section range, including accepted PE file-alignment bytes. */
   section_bytes: z.int().positive(),
+  /** Bytes consumed by the zlib stream; the inflate ratio uses this size. */
   compressed_bytes: z.int().positive(),
   uncompressed_bytes: z.int().positive(),
   /** Original embedded revision; null means the source omitted the field. */
@@ -65,6 +63,15 @@ export const rustAuditableMetadataSchema = z.strictObject({
 /** Inferred compiler id from read-only `/rustc/<40-hex>/` paths. */
 export const rustcCommitSchema = z.strictObject({
   evidence_kind: z.literal("inferred"),
+  coverage: z
+    .strictObject({
+      status: z.literal("partial"),
+      reason: z.enum(["max_rustc_hashes", "report_bytes"]),
+      effective_limit: z.int().positive(),
+      /** The request parameter that bounded retention, and how to change it. */
+      limit: analysisParameterLimitSchema.exactOptional(),
+    })
+    .exactOptional(),
   hashes: z
     .array(
       z.strictObject({
@@ -75,12 +82,62 @@ export const rustcCommitSchema = z.strictObject({
     .min(1),
 });
 
+/**
+ * The complete-report allowance left no room for any compiler path; the
+ * control that bounded it, recorded outside the dropped compiler record.
+ */
+export const rustcCommitOmissionSchema = z.strictObject({
+  reason: z.literal("report_bytes"),
+  limit: analysisParameterLimitSchema,
+});
+
+type RustcCoverage = NonNullable<z.infer<typeof rustcCommitSchema>["coverage"]>;
+
+/**
+ * Partial compiler-path coverage and the per-call control that bounded it:
+ * `max_rustc_hashes` for the path count, `producer_limits.output_bytes` for
+ * the complete-report allowance. Each adapter names the option that sets it.
+ */
+export const rustcPartialCoverage = (
+  reason: RustcCoverage["reason"],
+  effectiveLimit: number,
+): RustcCoverage => ({
+  status: "partial",
+  reason,
+  effective_limit: effectiveLimit,
+  limit:
+    reason === "report_bytes"
+      ? producerLimitControl(
+          "output_bytes",
+          effectiveLimit,
+          RUST_PRODUCER_DEFAULTS.output_bytes,
+        )
+      : {
+          control_kind: "parameter",
+          parameter: "max_rustc_hashes",
+          effective_value: effectiveLimit,
+          unit: "count",
+          minimum: 1,
+          maximum: Number.MAX_SAFE_INTEGER,
+          default_value: DEFAULT_RUSTC_HASH_LIMIT,
+          applies_at: "next_call",
+        },
+});
+
 /** One explicit local executable or library, independent of a disassembler target. */
 export const inspectRustBinaryInputSchema = z.strictObject({
   path: absoluteLocalPathStringSchema.describe(
     "Absolute filesystem path to the selected executable or library",
   ),
   architecture: machoSliceArchitectureSchema.exactOptional(),
+  producer_limits: rustProducerLimitsField,
+  max_rustc_hashes: z
+    .int()
+    .positive()
+    .exactOptional()
+    .describe(
+      `Maximum distinct inferred compiler paths to retain (default ${String(DEFAULT_RUSTC_HASH_LIMIT)}). Omitted paths leave compiler coverage partial without discarding dependency facts. Raise this value on the next call to recover a larger prefix; complete-report byte admission still applies.`,
+    ),
 });
 
 /** Bounded cargo-auditable observation. A missing section is null, not an empty dependency list. */
@@ -99,6 +156,11 @@ export const rustBinarySchema = z
     selected_slice: machoTargetSelectionSchema.exactOptional(),
     auditable_metadata: rustAuditableMetadataSchema.nullable(),
     rustc_commit: rustcCommitSchema.nullable(),
+    /**
+     * Present when the complete-report allowance left no room for any
+     * compiler path, so `rustc_commit` is null: the control that bounded it.
+     */
+    rustc_commit_omission: rustcCommitOmissionSchema.exactOptional(),
     limitations: z.array(z.string()),
   })
   .superRefine((report, context) => {
@@ -108,6 +170,15 @@ export const rustBinarySchema = z
       checkPackages(metadata, context);
     }
     checkRustc(report.artifact.bytes, report.rustc_commit, context);
+    if (
+      report.rustc_commit_omission !== undefined &&
+      report.rustc_commit !== null
+    )
+      issue(
+        context,
+        ["rustc_commit_omission"],
+        "A compiler-path omission is recorded only when no compiler path was retained.",
+      );
     checkSlice(report, context);
   });
 
@@ -136,12 +207,12 @@ const checkSection = (
 ): void => {
   if (
     !inside(fileBytes, metadata.file_offset, metadata.section_bytes) ||
-    metadata.compressed_bytes !== metadata.section_bytes
+    metadata.compressed_bytes > metadata.section_bytes
   )
     issue(
       context,
       ["auditable_metadata", "file_offset"],
-      "Dependency section range is outside the selected artifact or disagrees with its compressed size.",
+      "Dependency section range is outside the selected artifact or shorter than its compressed stream.",
     );
 };
 
@@ -327,7 +398,7 @@ const checkSlice = (report: RustBinary, context: z.RefinementCtx): void => {
     !selectedSliceAgreesWithReport(
       slice,
       report.format,
-      rustArchitectureForSubject(report.architecture),
+      binaryMetadataArchitecture(report.architecture),
     ) ||
     ranges.some(
       ({ offset, bytes }) =>

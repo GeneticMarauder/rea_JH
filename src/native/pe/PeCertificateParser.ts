@@ -1,5 +1,7 @@
-import { createHash } from "node:crypto";
-import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
+import {
+  ArtifactReaderFailure,
+  artifactParseFailure,
+} from "../../resources/index.js";
 import type {
   InspectPeCertificatesInput,
   PeCertificates,
@@ -8,12 +10,23 @@ import { peCertificateTypeName } from "../../domain/native/peCertificates.js";
 import {
   oidName,
   parsePkcs7SignedData,
-  PeCertificateDerFailure,
-} from "./PeCertificateDer.js";
-import { readPeHeaders } from "./PeResourceLayout.js";
+  PeCertificateAsn1Failure,
+  readAsn1,
+} from "./PeCertificateAsn1.js";
+import { readPeHeaders } from "../../domain/pe/peResourceLayout.js";
+import { sha256Hex } from "../../kernel/sha256Hex.js";
 
 const fail = (message: string): never => {
   throw new ArtifactReaderFailure("format", message);
+};
+
+/** Shared PE header admission, with malformed headers as format failures. */
+const readCertificateImageHeaders = (bytes: Buffer) => {
+  try {
+    return readPeHeaders(bytes);
+  } catch (cause) {
+    throw artifactParseFailure(cause, undefined);
+  }
 };
 
 const requireRange = (bytes: Buffer, offset: number, length: number): void => {
@@ -31,13 +44,16 @@ const requireRange = (bytes: Buffer, offset: number, length: number): void => {
 
 const align8 = (value: number): number => Math.ceil(value / 8) * 8;
 
-const sha256 = (bytes: Buffer): string =>
-  createHash("sha256").update(bytes).digest("hex");
-
 const LIMITATIONS = [
   "This workflow does not verify signatures, certificate chains, timestamps, or Authenticode digest coverage of image bytes.",
   "PKCS#7 fields are decoded structurally; cryptographic validity remains unobserved.",
 ] as const;
+
+const TELETEX_LIMITATION =
+  "TeletexString values use OpenSSL's ISO-8859-1 compatibility mapping; this is not a full T.61 decoder.";
+
+const UNSIGNED_ATTRIBUTES_LIMITATION =
+  "Signer unsigned attribute contents are not decoded; nested signatures and timestamp token certificates and times may be omitted.";
 
 const ABSENT_LIMITATIONS = [
   "IMAGE_DIRECTORY_ENTRY_SECURITY is absent. That is not proof the image is unsigned in every catalog or overlay sense.",
@@ -50,12 +66,13 @@ export const parsePeCertificates = (
   artifact: PeCertificates["artifact"],
   input: InspectPeCertificatesInput,
 ): PeCertificates => {
-  const { pe, optional, magic, directoriesAt, directoryCount, headerSize } =
-    readPeHeaders(bytes);
-  const machine = bytes.readUInt16LE(pe + 4);
-  const format = magic === 0x20b ? "pe32-plus" : "pe32";
-  const securityIndex = 4;
-  if (directoryCount <= securityIndex) {
+  const { machine, format, dataDirectories, headerSize, optionalHeaderOffset } =
+    readCertificateImageHeaders(bytes);
+  const security = dataDirectories[4];
+  if (
+    security === undefined ||
+    (security.address === 0 && security.size === 0)
+  ) {
     return {
       artifact,
       format,
@@ -66,28 +83,20 @@ export const parsePeCertificates = (
       limitations: [...ABSENT_LIMITATIONS],
     };
   }
-  const directoryAt = optional + directoriesAt + securityIndex * 8;
-  requireRange(bytes, directoryAt, 8);
-  const tableOffset = bytes.readUInt32LE(directoryAt);
-  const tableSize = bytes.readUInt32LE(directoryAt + 4);
-  if (tableOffset === 0 && tableSize === 0) {
-    return {
-      artifact,
-      format,
-      machine,
-      table: null,
-      entries: [],
-      coverage: { status: "complete", examined_entries: 0, certificates: 0 },
-      limitations: [...ABSENT_LIMITATIONS],
-    };
-  }
+  const tableOffset = security.address;
+  const tableSize = security.size;
+  const directoryAt = optionalHeaderOffset + security.offset;
   if (tableSize === 0 || tableOffset < headerSize)
     fail("PE certificate table offset overlaps headers or has zero size.");
+  if (tableOffset % 8 !== 0)
+    fail("PE certificate table offset must be aligned to eight bytes.");
   requireRange(bytes, tableOffset, tableSize);
   const table = bytes.subarray(tableOffset, tableOffset + tableSize);
   const entries: PeCertificates["entries"] = [];
   let at = 0;
   let examined = 0;
+  let teletexStringCompatibilityUsed = false;
+  let unsignedAttributesPresent = false;
   while (at < table.length) {
     // Alignment padding sits inside the gap before the next 8-byte boundary.
     // Bytes that remain after that boundary are a short header, including
@@ -107,11 +116,31 @@ export const parsePeCertificates = (
       fail("WIN_CERTIFICATE dwLength is shorter than its header.");
     if (at + length > table.length)
       fail("WIN_CERTIFICATE dwLength exceeds the certificate table.");
-    const payload = table.subarray(at + 8, at + length);
+    const entryPayload = table.subarray(at + 8, at + length);
+    let payload = entryPayload;
     let pkcs7: PeCertificates["entries"][number]["pkcs7"] = null;
     if (peCertificateTypeName(certificateType) === "pkcs7") {
       try {
-        const parsed = parsePkcs7SignedData(payload);
+        // dwLength may include the zero bytes that align the complete
+        // WIN_CERTIFICATE to eight bytes. Bound CMS to its encoded ASN.1 root;
+        // tolerate only the corresponding alignment bytes, never arbitrary
+        // trailing data.
+        const root = readAsn1(entryPayload);
+        const paddingBytes = entryPayload.length - root.end;
+        const alignedLength = align8(8 + root.end);
+        if (
+          paddingBytes !== 0 &&
+          (8 + entryPayload.length !== alignedLength ||
+            !entryPayload.subarray(root.end).every((byte) => byte === 0))
+        )
+          fail("WIN_CERTIFICATE has invalid PKCS#7 alignment padding.");
+        payload = entryPayload.subarray(0, root.end);
+        const parsed = parsePkcs7SignedData(root);
+        teletexStringCompatibilityUsed ||=
+          parsed.teletexStringCompatibilityUsed;
+        unsignedAttributesPresent ||= parsed.signers.some(
+          (signer) => signer.unsigned_attribute_oids !== null,
+        );
         pkcs7 = {
           content_type_oid: parsed.content_type_oid,
           content_type_name: oidName(parsed.content_type_oid),
@@ -121,7 +150,7 @@ export const parsePeCertificates = (
               offset: tableOffset + at + 8 + certificate.start,
               bytes: certificate.end - certificate.start,
             },
-            der_sha256: sha256(
+            der_sha256: sha256Hex(
               payload.subarray(certificate.start, certificate.end),
             ),
             serial_hex: certificate.serial_hex,
@@ -155,10 +184,19 @@ export const parsePeCertificates = (
             serial_hex: signer.serial_hex,
             subject_key_identifier_hex: signer.subject_key_identifier_hex,
             authenticated_attributes: signer.authenticated_attributes,
+            unsigned_attribute_oids:
+              signer.unsigned_attribute_oids === null
+                ? null
+                : [...signer.unsigned_attribute_oids],
           })),
         };
       } catch (cause) {
-        if (cause instanceof PeCertificateDerFailure)
+        // An exhausted decoder allowance is not evidence of malformed DER;
+        // the provider reports it as a fixed resource allowance.
+        if (
+          cause instanceof PeCertificateAsn1Failure &&
+          cause.exhausted === null
+        )
           fail(`PKCS#7 signedData is malformed: ${cause.message}`);
         throw cause;
       }
@@ -173,7 +211,7 @@ export const parsePeCertificates = (
       payload: {
         location: { offset: tableOffset + at + 8, bytes: payload.length },
         bytes: payload.length,
-        sha256: sha256(payload),
+        sha256: sha256Hex(payload),
       },
       pkcs7,
     });
@@ -195,10 +233,14 @@ export const parsePeCertificates = (
     },
     entries,
     coverage: {
-      status: "complete",
+      status: unsignedAttributesPresent ? "partial" : "complete",
       examined_entries: examined,
       certificates,
     },
-    limitations: [...LIMITATIONS],
+    limitations: [
+      ...LIMITATIONS,
+      ...(teletexStringCompatibilityUsed ? [TELETEX_LIMITATION] : []),
+      ...(unsignedAttributesPresent ? [UNSIGNED_ATTRIBUTES_LIMITATION] : []),
+    ],
   };
 };

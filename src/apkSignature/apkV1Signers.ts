@@ -5,6 +5,7 @@
  * hands every certificate to the shared certificate owner.
  */
 import { inflateRawSync } from "node:zlib";
+import { hostRangeErrorKind } from "../domain/parseFailure.js";
 
 import type { ApkSignatureResult } from "../domain/apkSignature/apkSignatureReport.js";
 import {
@@ -105,7 +106,7 @@ export const decodeV1Signer = (
       data = inflateRawSync(stored.value.data, { maxOutputLength: limit });
     } catch (cause: unknown) {
       return fail(
-        cause instanceof RangeError
+        hostRangeErrorKind(cause) === "host-capacity"
           ? `signature block inflates past the ${String(limit)}-byte bound`
           : "signature block deflate stream is damaged",
       );
@@ -186,16 +187,10 @@ export const v1SignerFacts = ({
     // Without verification, a block with several SignerInfos has no one signer.
     certificate:
       infos.length === 1 ? named(infos[0]?.certificateIndex ?? null) : null,
-    certificates: facts.flatMap((fact) =>
-      fact === null
-        ? []
-        : [
-            {
-              sha256_fingerprint: fact.sha256_fingerprint,
-              subject: fact.subject,
-            },
-          ],
-    ),
+    certificates: facts.map(({ sha256_fingerprint, subject }) => ({
+      sha256_fingerprint,
+      subject,
+    })),
     signer_infos: infos.map((info) => ({
       identified_by: info.identifiedBy,
       certificate_sha256:

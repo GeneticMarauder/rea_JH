@@ -1,3 +1,4 @@
+import { evidenceSubjectDisplay } from "../evidence.js";
 import { z } from "zod";
 import { AnalysisInputError } from "../analysisErrorCore.js";
 
@@ -19,8 +20,7 @@ import {
   hasCompleteInventoryCoverage,
   type ParsedInventorySet,
 } from "../artifactInventoryEvidence.js";
-import { digestSchema } from "../digests.js";
-import { prefixedDigestSchema } from "../digests.js";
+import { digestSchema, prefixedDigestSchema } from "../digests.js";
 import { digestCanonicalValue } from "../canonicalDigest.js";
 import {
   bridgeCandidateCoverageSchema,
@@ -115,7 +115,7 @@ export const projectAppleInventory = (
     projectedInventoryEntries(inventory);
   const inventoried = projectedFileComponents(entries);
   const { roots, bundles } = projectAppleBundleAnatomy(entries, {
-    name: evidence[0]?.subject?.name ?? "",
+    name: evidenceSubjectDisplay(evidence[0] ?? {})?.name ?? "",
     format: rootFormat,
   });
   const { all, unattributed } = attributeComponents(
@@ -133,7 +133,7 @@ export const projectAppleInventory = (
     roots,
     rootFormat,
   );
-  const classified = classifyComponents(entries, all, roots);
+  const classified = classifyComponents(entries, all, roots, bundles);
   const runtimeFamilies = identifyRuntimeFamilies(all);
   const bridgeProjection = identifyBridgeCandidates(
     classified.javascript,
@@ -263,7 +263,11 @@ const classifyComponents = (
   entries: readonly ProjectedInventoryEntry[],
   all: readonly Component[],
   roots: readonly string[],
+  bundles: readonly z.infer<typeof appleBundleSchema>[],
 ) => {
+  const frameworkRoots = bundles
+    .filter(({ role }) => role === "framework")
+    .map(({ path }) => path);
   const withinApp = (path: string): boolean =>
     roots.some((root) => isWithin(path, root));
   const matching = (predicate: (path: string) => boolean): Component[] =>
@@ -286,7 +290,9 @@ const classifyComponents = (
       ({ path, format }) =>
         isMachOFormat(format) && (withinApp(path) || !isNativeLibrary(path)),
     ),
-    frameworks: all.filter(({ path }) => /\.framework\//u.test(path)),
+    frameworks: all.filter(({ path }) =>
+      frameworkRoots.some((root) => isWithin(path, root)),
+    ),
     native_libraries: all.filter(({ path }) => isNativeLibrary(path)),
     javascript: all.filter(({ format }) => format === "javascript-bundle"),
     signing: all.filter(

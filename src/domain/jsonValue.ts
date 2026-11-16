@@ -1,6 +1,7 @@
 import { types } from "node:util";
 import { z } from "zod";
 import { isImmutableJsonSnapshot } from "./immutableJson.js";
+import { isRecord } from "../kernel/isRecord.js";
 
 /** Maximum JSON nesting accepted before recursive result cloning. */
 export const MAX_JSON_DEPTH = 1000;
@@ -14,8 +15,6 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
 const immutableValidation = new WeakMap<object, string | undefined>();
 
 /** Validate JSON meaning and nesting without cloning a trusted immutable value. */
@@ -90,7 +89,7 @@ export function* jsonValueValidationSteps(
           kind: "array",
           value,
           depth,
-          index: value.length - 1,
+          index: 0,
         });
         inspect = false;
       } else if (isRecord(value)) {
@@ -114,11 +113,11 @@ export function* jsonValueValidationSteps(
     const frame = pending[pending.length - 1];
     if (frame === undefined) return finish(undefined);
     if (frame.kind === "array") {
-      if (frame.index < 0) {
+      if (frame.index >= frame.value.length) {
         pending.pop();
         continue;
       }
-      const index = frame.index--;
+      const index = frame.index++;
       const descriptor = Object.getOwnPropertyDescriptor(frame.value, index);
       if (descriptor === undefined || !Object.hasOwn(descriptor, "value"))
         return finish(
@@ -204,3 +203,8 @@ objectValidation._zod.toJSONSchema = objectProjection;
 /** JSON object boundary for caller-visible parameter maps. */
 export const jsonObjectSchema = jsonValueSchema.pipe(objectValidation);
 jsonObjectSchema._zod.toJSONSchema = objectProjection;
+
+/** Validate an exclusively owned JSON object while retaining its existing tree. */
+export const ownedJsonObjectSchema =
+  ownedJsonValueSchema.pipe(objectValidation);
+ownedJsonObjectSchema._zod.toJSONSchema = objectProjection;

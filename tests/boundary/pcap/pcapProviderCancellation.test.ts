@@ -1,3 +1,4 @@
+import { UnclassifiedProviderFailure } from "../../../src/domain/unclassifiedProviderFailure.js";
 import { realpath, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { expect, onTestFinished, test, vi } from "vitest";
@@ -6,9 +7,9 @@ import {
   AnalysisArtifactChangedError,
   AnalysisCancelledError,
 } from "../../../src/domain/analysisErrorCore.js";
-import { AnalysisCleanupLease } from "../../../src/artifacts/AnalysisCleanupLease.js";
-import { ArtifactReaderFailure } from "../../../src/artifacts/ArtifactReader.js";
-import { readStableArtifact } from "../../../src/artifacts/readStableArtifact.js";
+import { AnalysisCleanupLease } from "../../../src/resources/AnalysisCleanupLease.js";
+import { ArtifactReaderFailure } from "../../../src/resources/ArtifactReader.js";
+import { readStableArtifact } from "../../../src/resources/readStableArtifact.js";
 import { ProviderCleanupError } from "../../../src/domain/providerCleanupError.js";
 import { resolvedAnalysisError } from "../../../src/domain/analysisErrorBase.js";
 import { PrivateRuntimeRoot } from "../../../src/process/PrivateRuntimeRoot.js";
@@ -144,9 +145,11 @@ const probeCleanupFixture = async (rereadCloseFailure = false) => {
     if (tsharkReads !== 3) return snapshot;
     if (!rereadCloseFailure) return { ...snapshot, sha256: "0".repeat(64) };
     const resource = `executable-read:${tshark}`;
+    const lease = new AnalysisCleanupLease(async () => {}, [resource]);
+    args[4]?.retain({ kind: "lease", resource, lease });
     throw new ArtifactReaderFailure("io", "injected executable read failure", {
       cleanup: { reason: "injected file close failure", resources: [resource] },
-      cleanupLeases: [new AnalysisCleanupLease(async () => {}, [resource])],
+      cleanupLeases: [lease],
     });
   };
   const provider = new PcapProvider({
@@ -196,6 +199,8 @@ it("keeps an executable re-read's own cleanup live beside the probe's pending cl
       expect.stringMatching(/^process-group:/u),
     ]),
   );
+  await provider.close();
+  expect(result.error.cleanupIncomplete).toBe(false);
 });
 
 it("availability surfaces a probe's pending cleanup instead of reporting the tool unavailable", async () => {
@@ -364,7 +369,7 @@ it("a physical command failure survives a late cancellation and cleanup retry", 
   if (result.ok) return;
   const returned = result.error;
   const primary = returned.cleanupPrimary;
-  expect(primary?._tag).toBe("AnalysisProtocolError");
+  expect(primary).toBeInstanceOf(UnclassifiedProviderFailure);
   expect(primary?.cause).not.toBe(reason);
   expect(projectAnalysisError(returned).code).toBe("cleanup_incomplete");
   expect(returned.capturedOutput?.stderr).toContain(

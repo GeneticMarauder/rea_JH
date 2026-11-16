@@ -1,5 +1,7 @@
 import type { JsonValue } from "../../src/domain/jsonValue.js";
 import type { CdpEvent } from "../../src/browser/CdpConnection.js";
+import type { ServerResponse } from "node:http";
+import type { PhaseGate } from "../support/lifecycleHarness.js";
 export interface FakeCdpCommand {
   readonly id: number;
   readonly method: string;
@@ -17,8 +19,10 @@ export interface FakeCdpBrowser {
   /** WebSocket upgrades accepted over the fixture's lifetime. */
   openedConnectionCount(): number;
   /** Deliver actual malformed wire data without bypassing the production transport parser. */
-  emitRawMessage(message: string): void;
+  emitRawMessage(message: string | Buffer): void;
   emitEvent(event: CdpEvent): void;
+  /** Drop currently open WebSockets from the server side to exercise reconnect paths. */
+  closeActiveConnections(): void;
   readonly httpRequests: readonly {
     readonly url: string;
     readonly authorization: string | undefined;
@@ -50,6 +54,13 @@ export interface FakeOptions {
   readonly discoveryDelayMs?: number;
   /** Delay WebSocket upgrade acceptance so handshake and attach deadlines stay distinct. */
   readonly handshakeDelayMs?: number;
+  /**
+   * Hold each WebSocket upgrade (by request URL) until the test releases the
+   * gate. A held socket the client abandons is destroyed, not accepted.
+   */
+  readonly handshakeGate?: PhaseGate<string>;
+  /** Delay selected wire replies so one caller's discovery deadline can expire alongside an active peer. */
+  readonly commandDelayMs?: (command: FakeCdpCommand) => number | undefined;
   readonly malformedDiscovery?: boolean;
   readonly oversizedDiscovery?: boolean;
   readonly invalidBrowserWebSocket?: boolean;
@@ -90,6 +101,8 @@ export interface FakeOptions {
   readonly webSocketWithoutFrames?: boolean;
   readonly invalidBinaryWebSocketEvent?: boolean;
   readonly sourceMapBody?: string;
+  /** Test-owned HTTP response for selected map URLs; true means handled. */
+  readonly sourceMapReply?: (url: string, response: ServerResponse) => boolean;
   /** Accept a source-map request and leave the response open. */
   readonly hangSourceMap?: boolean;
   readonly sourceMapRedirect?: string;
@@ -113,7 +126,6 @@ export interface FakeOptions {
   readonly webMcpSameUrlRegistrations?: "retain" | "remove-second";
   readonly webMcpFrameCount?: number;
   readonly webMcpSchemaPropertyCount?: number;
-  readonly webMcpInputSchema?: JsonValue;
   readonly webMcpChildLeavesScope?: boolean;
   readonly webMcpChildTransientBlank?: boolean;
   readonly webMcpChildRecoversAfterTransient?: boolean;

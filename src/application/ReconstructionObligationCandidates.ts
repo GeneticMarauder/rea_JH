@@ -3,16 +3,13 @@ import { digestCanonicalValue } from "../domain/canonicalDigest.js";
 
 import type { Evidence } from "../domain/evidence.js";
 import { describeValidationFailure } from "../domain/validationFailure.js";
-import { z } from "zod";
-import {
-  parseProcessCapture,
-  type ProcessCapture,
-} from "../domain/process/processCaptureParsing.js";
 import type {
   ReconstructionObligation,
   ReviewedReconstructionObligation,
 } from "../domain/reconstructionObligationLedgerSchemas.js";
 import { parseApplicationGraphEvidence } from "./javascript/JavaScriptApplicationEvidenceGraph.js";
+import { parseProcessCaptureEvidence } from "./process/ProcessEvidence.js";
+import { evidenceSupportsOriginalAuthority } from "./ReconstructionObligationAuthority.js";
 import {
   applicationObligationPolicy,
   semanticObligationPolicy,
@@ -181,45 +178,49 @@ const deriveApplicationCandidates = (
 };
 
 const deriveProcessCandidate = (
-  evidence: Evidence,
+  input: Evidence,
   candidates: Map<string, ReconstructionObligationCandidate>,
   limitations: Set<string>,
 ): void => {
-  if (
-    evidence.operation !== "capture_process_scenario" ||
-    evidence.predicate_type !== "rea.process-capture"
-  )
-    return;
-  let capture: ProcessCapture;
-  try {
-    capture = parseProcessCapture(evidence.normalized_result);
-  } catch (cause: unknown) {
-    if (!(cause instanceof z.ZodError)) throw cause;
-    limitations.add(
-      `Process Evidence ${evidence.evidence_id} could not generate candidates: ${describeValidationFailure(cause)}`,
-    );
+  const parsed = parseProcessCaptureEvidence(input);
+  if (!parsed.ok) {
+    switch (parsed.error.kind) {
+      case "wrong-workflow":
+        break;
+      case "unsupported-provider":
+        limitations.add(
+          `Process Evidence ${input.evidence_id} has an unsupported provider; process lifecycle candidates remain unknown.`,
+        );
+        break;
+      case "invalid-evidence":
+      case "invalid-capture":
+        limitations.add(
+          `Process Evidence ${input.evidence_id} could not generate candidates: ${describeValidationFailure(parsed.error.cause)}`,
+        );
+    }
     return;
   }
+  const { record: evidence, capture } = parsed.value;
   const observedCases: ReconstructionObligation["observed_cases"] = [
-    {
-      kind: capture.exit.code === 0 ? "positive" : "negative",
-      evidence_id: evidence.evidence_id,
-      location: "/normalized_result/exit",
-    },
+    ...(capture.exit.reason !== "exited" ||
+    (capture.exit.signal !== null && capture.exit.signal !== 0) ||
+    capture.exit.code === null
+      ? []
+      : [
+          {
+            kind:
+              capture.exit.code === 0
+                ? ("positive" as const)
+                : ("negative" as const),
+            evidence_id: evidence.evidence_id,
+            location: "/normalized_result/exit",
+          },
+        ]),
     {
       kind: "teardown",
       evidence_id: evidence.evidence_id,
       location: "/normalized_result/settlement",
     },
-    ...(capture.exit.signal !== null || capture.exit.reason !== "exited"
-      ? [
-          {
-            kind: "cancellation" as const,
-            evidence_id: evidence.evidence_id,
-            location: "/normalized_result/exit",
-          },
-        ]
-      : []),
   ];
   if (capture.manifest.executable_sha256 === null) {
     limitations.add(
@@ -396,12 +397,7 @@ const graphReference = (
 const reviewedEvidenceState = (
   evidence: Evidence,
 ): ReconstructionObligation["authority_references"][number]["state"] => {
-  if (
-    evidence.operation === "capture_process_scenario" &&
-    evidence.predicate_type === "rea.process-capture" &&
-    evidence.confidence === "observed"
-  )
-    return "observed";
+  if (evidenceSupportsOriginalAuthority(evidence, "process")) return "observed";
   if (
     evidence.authority === "external-service" &&
     evidence.confidence === "observed"

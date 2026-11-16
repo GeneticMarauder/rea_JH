@@ -1,15 +1,23 @@
-import { writeFile } from "node:fs/promises";
+import { fileSubjectTarget } from "../fixtures/evidenceSubject.js";
+import { unknownTarget } from "../../src/domain/targetIdentity.js";
+import { stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { InMemoryTransport, Client } from "@modelcontextprotocol/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { z } from "zod";
 
 import { ARTIFACT_COMPARISON_EXAMPLE } from "../../src/contracts/artifactComparisonExample.js";
 import { FUNCTION_COMPARISON_EXAMPLE } from "../../src/contracts/functionComparisonExample.js";
 import { completeReconstructionCoverageData } from "../../src/domain/reconstructionCoverage.fixture.js";
 import { reconstructionClosureResultSchema } from "../../src/domain/reconstructionCoverage.js";
-import { createEvidence } from "../../src/domain/evidence.js";
+import {
+  createEvidence,
+  evidenceSubjectInput,
+} from "../../src/domain/evidence.js";
+import { RetainedRegularFileCleanupFailure } from "../../src/process/RegularFileRead.js";
+import { OwnedFileHandle } from "../../src/filesystem/OwnedFileHandle.js";
+import { primaryAnalysisError } from "../../src/domain/analysisErrorBase.js";
 import { functionComparisonResultSchema } from "../../src/domain/functionComparisonSchemas.js";
 import { createServer } from "../../src/server/createServer.js";
 import { createTestBinarySession } from "../fixtures/binarySession.js";
@@ -26,9 +34,12 @@ import { managedMemberComparisonResultSchema } from "../../src/domain/managed/ma
 import { managedNativeVerificationResultSchema } from "../../src/domain/managed/managedNativeVerificationSchemas.js";
 import { managedReconstructionImportResultSchema } from "../../src/domain/managed/managedReconstruction.js";
 
-import { compareManagedMemberPaths } from "../../src/application/managed/ManagedMemberComparisonService.js";
+import { captureProcessScenarioFile } from "../../src/application/process/ProcessCli.js";
+import { managedComparisonCommand } from "../fixtures/managedComparisonCommand.js";
 import { buildManagedPeFixture } from "../../src/dotnet/ManagedPe.fixture.js";
 import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
+import { wasmArtifactFixture } from "../fixtures/wasm/artifact.js";
+import { ProcessCaptureError } from "../../src/process/capture/ProcessCaptureError.js";
 
 import { reconstructionObligationLedgerSchema } from "../../src/domain/reconstructionObligationLedgerSchemas.js";
 import {
@@ -36,9 +47,35 @@ import {
   processEvidence,
 } from "../../src/application/ReconstructionObligationLedger.fixture.js";
 import { processCaptureSchema } from "../../src/domain/process/processCapture.js";
-import { JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE } from "../../src/contracts/javascript/javascriptRuntimeReconciliationExample.js";
+import {
+  JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE,
+  JAVASCRIPT_RUNTIME_RECONCILIATION_EXAMPLE,
+} from "../../src/contracts/javascript/javascriptRuntimeReconciliationExample.js";
 import { javascriptApplicationAnalysisResultSchema } from "../../src/domain/javascript/javascriptApplicationAnalysis.js";
 import { javaScriptSemanticQueryResultSchema } from "../../src/domain/javascript/javascriptSemanticQuerySchemas.js";
+import {
+  JAVASCRIPT_FEATURE_TRACE_EXAMPLE,
+  JAVASCRIPT_APPLICATION_VERSION_COMPARISON_EXAMPLE,
+  SOURCE_TO_BUNDLE_COMPARISON_EXAMPLE,
+} from "../../src/contracts/javascript/javascriptApplicationWorkflowExamples.js";
+import { JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE } from "../../src/contracts/javascript/javascriptExportShapeComparisonExample.js";
+import { applicationFeatureTraceResultSchema } from "../../src/domain/javascript/javascriptFeatureTraceSchemas.js";
+import { ownedApplicationVersionComparisonResultSchema } from "../../src/domain/javascript/javascriptApplicationVersionComparisonSchemas.js";
+import { javaScriptExportShapeComparisonResultSchema } from "../../src/domain/javascript/javascriptExportShapeComparisonSchemas.js";
+import { sourceToBundleComparisonResultSchema } from "../../src/domain/javascript/sourceToBundleComparisonSchemas.js";
+import { javascriptRuntimeReconciliationResultSchema } from "../../src/domain/javascript/javascriptRuntimeReconciliationSchemas.js";
+import { browserCompletenessSchema } from "../../src/domain/browserCompleteness.js";
+import { createElectronActiveEvidence } from "../../src/application/javascript/ElectronActiveEvidence.js";
+import { electronActiveObservationInputSchema } from "../../src/domain/javascript/electronActiveObservation.js";
+import { createElectronActiveObservationFixtureResult } from "../../src/domain/javascript/electronActiveObservation.fixture.js";
+
+import { nativeFunctionMatchingSchema } from "../../src/domain/native/functionMatching.js";
+import { FunctionByteCoverage } from "../../src/domain/native/functionByteCoverage.js";
+import {
+  nativeMatchingInventory,
+  nativeMatchingDetails,
+} from "../fixtures/nativeFunctionMatching.js";
+import { createMcpSchemaValidation } from "../fixtures/mcpSchemaValidation.js";
 
 /** Unexpected implementation failures retain the SDK text surface, without a typed caller error. */
 const expectUnexpectedToolFailure = (
@@ -65,17 +102,56 @@ const unexpectedResultFailures = [
   ],
 ] as const;
 
+describe.each([
+  {
+    name: "trace_application_feature",
+    input: JAVASCRIPT_FEATURE_TRACE_EXAMPLE,
+    result: applicationFeatureTraceResultSchema,
+  },
+  {
+    name: "compare_application_versions",
+    input: JAVASCRIPT_APPLICATION_VERSION_COMPARISON_EXAMPLE,
+    result: ownedApplicationVersionComparisonResultSchema,
+  },
+  {
+    name: "compare_javascript_export_shapes",
+    input: JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE,
+    result: javaScriptExportShapeComparisonResultSchema,
+  },
+  {
+    name: "compare_source_to_bundle",
+    input: SOURCE_TO_BUNDLE_COMPARISON_EXAMPLE,
+    result: sourceToBundleComparisonResultSchema,
+  },
+])("$name output failures through the public SDK", (workflow) => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each(unexpectedResultFailures)(
+    "preserves an unexpected %s without recording sources or derived Evidence",
+    async (_kind, createFailure) => {
+      await withSdk(async ({ client, session }) => {
+        const failure = createFailure();
+        vi.spyOn(workflow.result, "parse").mockImplementation(() => {
+          throw failure;
+        });
+        const response = await client.callTool({
+          name: workflow.name,
+          arguments: workflow.input,
+        });
+        expectUnexpectedToolFailure(response, failure);
+        expect(session.exportEvidenceBundle().records).toEqual([]);
+        expect(session.exportEvidenceBundle().unknowns).toEqual([]);
+      });
+    },
+  );
+});
+
 const invalidFunctionOperationEvidence = () => {
   const left = FUNCTION_COMPARISON_EXAMPLE.left;
-  if (left.subject === null) throw new Error("Expected a function subject");
   return createEvidence(
     {
+      ...fileSubjectTarget(left.subject),
       path: "/tmp/wrong-function-operation",
-      sha256: left.subject.digest.sha256,
-      format: left.subject.format,
-      ...(left.subject.architecture === null
-        ? {}
-        : { architecture: left.subject.architecture }),
     },
     left.provider,
     {
@@ -94,15 +170,10 @@ const invalidFunctionOperationEvidence = () => {
 
 const malformedFunctionResultEvidence = () => {
   const left = FUNCTION_COMPARISON_EXAMPLE.left;
-  if (left.subject === null) throw new Error("Expected a function subject");
   return createEvidence(
     {
+      ...fileSubjectTarget(left.subject),
       path: "/tmp/malformed-function-result",
-      sha256: left.subject.digest.sha256,
-      format: left.subject.format,
-      ...(left.subject.architecture === null
-        ? {}
-        : { architecture: left.subject.architecture }),
     },
     left.provider,
     {
@@ -131,10 +202,13 @@ const withSdk = async <Value>(
     );
   });
   const server = createServer({ kind: "session", session });
-  const client = new Client({
-    name: "derived-operation-failures",
-    version: "1",
-  });
+  const client = new Client(
+    {
+      name: "derived-operation-failures",
+      version: "1",
+    },
+    { jsonSchemaValidator: createMcpSchemaValidation() },
+  );
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
   try {
@@ -145,6 +219,167 @@ const withSdk = async <Value>(
     await Promise.allSettled([client.close(), server.close(), session.close()]);
   }
 };
+
+const activeRuntimeFixture = () => {
+  const root = join(process.cwd(), "active-runtime-fixture");
+  const applicationPath = join(root, "main.js");
+  const result = createElectronActiveObservationFixtureResult(applicationPath);
+  const input = {
+    ...electronActiveObservationInputSchema.parse({
+      executable_path: process.execPath,
+      application_path: applicationPath,
+      application_root: root,
+    }),
+    application_root: root,
+  };
+  const evidence = createElectronActiveEvidence(
+    input,
+    result,
+    {
+      id: "rea-playwright-electron-active",
+      name: "REA Playwright active Electron observation provider",
+      version: "1",
+    },
+    input,
+  );
+  return { evidence, result };
+};
+
+describe("runtime reconciliation failure ownership through the public SDK", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each(unexpectedResultFailures)(
+    "preserves an unexpected %s from generated reconciliation output",
+    async (_label, createFailure) => {
+      await withSdk(async ({ client, session }) => {
+        const failure = createFailure();
+        vi.spyOn(
+          javascriptRuntimeReconciliationResultSchema,
+          "parse",
+        ).mockImplementation(() => {
+          throw failure;
+        });
+        const response = await client.callTool({
+          name: "reconcile_javascript_runtime",
+          arguments: JAVASCRIPT_RUNTIME_RECONCILIATION_EXAMPLE,
+        });
+        expectUnexpectedToolFailure(response, failure);
+        expect(session.exportEvidenceBundle()).toMatchObject({
+          records: [],
+          unknowns: [],
+        });
+      });
+    },
+  );
+
+  it.each(unexpectedResultFailures)(
+    "preserves an unexpected %s while interpreting an authenticated active capture",
+    async (_label, createFailure) => {
+      await withSdk(async ({ client, session }) => {
+        const { evidence: runtime } = activeRuntimeFixture();
+        const failure = createFailure();
+        vi.spyOn(browserCompletenessSchema, "parse").mockImplementation(() => {
+          throw failure;
+        });
+        const response = await client.callTool({
+          name: "reconcile_javascript_runtime",
+          arguments: {
+            static_layers:
+              JAVASCRIPT_RUNTIME_RECONCILIATION_EXAMPLE.static_layers,
+            runtime_observations: [runtime],
+          },
+        });
+        expectUnexpectedToolFailure(response, failure);
+        expect(session.exportEvidenceBundle()).toMatchObject({
+          records: [],
+          unknowns: [],
+        });
+      });
+    },
+  );
+
+  it.each([
+    {
+      field: "payload",
+      path: ["normalized_result", "application", "application_path"],
+      reason: "invalid_type",
+    },
+    {
+      field: "parameters",
+      path: ["parameters", "resolved_paths", "application_root"],
+      reason: "invalid_type",
+    },
+    {
+      field: "scope",
+      path: ["normalized_result", "application", "application_path"],
+      reason: "invalid_value",
+    },
+  ])(
+    "keeps an invalid active $field at its caller path",
+    async ({ field, path, reason }) => {
+      await withSdk(async ({ client, session }) => {
+        const { evidence, result } = activeRuntimeFixture();
+        const runtime = createEvidence(
+          evidenceSubjectInput(evidence.subject),
+          evidence.provider,
+          {
+            operation: evidence.operation,
+            predicateType: evidence.predicate_type,
+            authority: evidence.authority,
+            confidence: evidence.confidence,
+            parameters:
+              field === "parameters"
+                ? {
+                    ...evidence.parameters,
+                    resolved_paths: {
+                      ...(evidence.parameters.resolved_paths as object),
+                      application_root: 3,
+                    },
+                  }
+                : evidence.parameters,
+            result:
+              field === "parameters"
+                ? result
+                : {
+                    ...result,
+                    application: {
+                      ...result.application,
+                      application_path:
+                        field === "payload"
+                          ? 3
+                          : join(
+                              process.cwd(),
+                              "another-application",
+                              "main.js",
+                            ),
+                    },
+                  },
+          },
+        );
+        const response = await client.callTool({
+          name: "reconcile_javascript_runtime",
+          arguments: {
+            static_layers:
+              JAVASCRIPT_RUNTIME_RECONCILIATION_EXAMPLE.static_layers,
+            runtime_observations: [runtime],
+          },
+        });
+        expect(response.isError).toBe(true);
+        expect(parseMcpToolError(response).error).toMatchObject({
+          code: "invalid_request",
+          details: {
+            operation: "reconcile_javascript_runtime",
+            issues: [{ path: ["runtime_observations", 0, ...path], reason }],
+          },
+        });
+        expect(session.exportEvidenceBundle()).toMatchObject({
+          records: [],
+          unknowns: [],
+        });
+      });
+    },
+  );
+});
 
 describe("derived operation failures through the public SDK", () => {
   afterEach(() => vi.restoreAllMocks());
@@ -333,11 +568,15 @@ describe.each(managedWorkflows)(
 
     it("rejects a malformed authenticated source payload as Evidence integrity", async () => {
       await withSdk(async ({ client, session }) => {
-        const source = createEvidence(undefined, workflow.source.provider, {
-          operation: workflow.source.operation,
-          parameters: {},
-          result: { malformed: true },
-        });
+        const source = createEvidence(
+          unknownTarget("not-observed"),
+          workflow.source.provider,
+          {
+            operation: workflow.source.operation,
+            parameters: {},
+            result: { malformed: true },
+          },
+        );
         const response = await client.callTool({
           name: workflow.name,
           arguments: { ...workflow.input, [workflow.sourceField]: source },
@@ -391,7 +630,7 @@ describe.each(managedWorkflows)(
 describe("managed comparison output failure with completed source reads", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("retains the left source and output failure cause after reading real artifacts", async () => {
+  it("retains both sources and the output failure cause after reading real artifacts", async () => {
     const root = await createTestTempDirectory("rea-managed-output-failure-");
     const leftPath = join(root, "left.dll");
     const rightPath = join(root, "right.dll");
@@ -409,21 +648,32 @@ describe("managed comparison output failure with completed source reads", () => 
       },
     );
 
-    const result = await compareManagedMemberPaths({ leftPath, rightPath });
-
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.error.cause).toBe(failure);
-    expect(result.error).toMatchObject({
-      _tag: "AnalysisOutputError",
-      partialObservation: {
-        operation: "inspect_managed_members",
-        subject: { local_path: leftPath },
-        normalized_result: {
-          methods: [expect.objectContaining({ token: "0x06000001" })],
+    expect(await managedComparisonCommand()(leftPath, rightPath)).toMatchObject(
+      {
+        code: "unreadable_output",
+        details: {
+          argument_observations: [
+            {
+              argument: "left",
+              observation: {
+                operation: "inspect_managed_members",
+                subject: { local_path: leftPath },
+                normalized_result: {
+                  methods: [expect.objectContaining({ token: "0x06000001" })],
+                },
+              },
+            },
+            {
+              argument: "right",
+              observation: {
+                operation: "inspect_managed_members",
+                subject: { local_path: rightPath },
+              },
+            },
+          ],
         },
       },
-    });
+    );
   });
 });
 
@@ -452,13 +702,13 @@ describe("ledger generation failure ownership through the public SDK", () => {
     },
   );
 
-  it.each(unexpectedResultFailures.filter(([kind]) => kind !== "ZodError"))(
+  it.each(unexpectedResultFailures)(
     "preserves an unexpected %s while deriving process candidates",
     async (_label, createFailure) => {
       await withSdk(async ({ client, session }) => {
         const input = ledgerRequest([processEvidence()]);
         const failure = createFailure();
-        vi.spyOn(processCaptureSchema, "parse").mockImplementation(() => {
+        vi.spyOn(processCaptureSchema, "safeParse").mockImplementation(() => {
           throw failure;
         });
         const response = await client.callTool({
@@ -467,6 +717,87 @@ describe("ledger generation failure ownership through the public SDK", () => {
         });
         expectUnexpectedToolFailure(response, failure);
         expect(session.exportEvidenceBundle().records).toEqual([]);
+      });
+    },
+  );
+});
+
+describe("process capture CLI cleanup failure projection", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("preserves sanitized unknown-process IDs and reasons through the capture CLI boundary", async () => {
+    const root = await createTestTempDirectory("rea-process-cli-cleanup-");
+    const scenario = join(root, "scenario.json");
+    await writeFile(
+      scenario,
+      JSON.stringify({ executable: process.execPath, arguments: [] }),
+    );
+    const reason =
+      "process ownership token could not be read for 1 live process(es): environment_unavailable=1; live candidates 900=environment_unavailable";
+    const failure = new ProcessCaptureError("cleanup incomplete", {
+      reason: "cleanup_incomplete",
+      cleanup: { reason, resources: ["owned_process_group"] },
+      cleanupReport: {
+        owned_process_group: {
+          state: "unverified",
+          reason,
+          unverified_processes: [
+            { pid: 900, reason: "environment_unavailable" },
+          ],
+        },
+        terminal_renderer: { state: "cleaned", reason: null },
+        temporary_root: { state: "cleaned", reason: null },
+      },
+    });
+    const processHarness =
+      await import("../../src/process/capture/ProcessHarness.js");
+    vi.spyOn(processHarness, "captureProcessScenario").mockResolvedValue({
+      ok: false,
+      error: failure,
+    });
+
+    const projected = await captureProcessScenarioFile(scenario);
+
+    expect(projected).toMatchObject({
+      error: "Process command failed",
+      code: "cleanup_incomplete",
+      details: {
+        cleanup_report: {
+          owned_process_group: {
+            reason,
+            unverified_processes: [
+              { pid: 900, reason: "environment_unavailable" },
+            ],
+          },
+        },
+      },
+    });
+  });
+});
+
+describe("process comparison Evidence authentication failures through the public SDK", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each(unexpectedResultFailures.filter(([kind]) => kind !== "ZodError"))(
+    "preserves an unexpected %s without retaining Evidence",
+    async (_label, createFailure) => {
+      await withSdk(async ({ client, session }) => {
+        const input = {
+          left: processEvidence(),
+          right: processEvidence(),
+        };
+        const failure = createFailure();
+        const evidenceModule = await import("../../src/domain/evidence.js");
+        vi.spyOn(evidenceModule, "parseEvidence").mockImplementation(() => {
+          throw failure;
+        });
+        const response = await client.callTool({
+          name: "compare_process_captures",
+          arguments: input,
+        });
+        expectUnexpectedToolFailure(response, failure);
+        expect(session.exportEvidenceBundle().records).toEqual([]);
+        expect(session.exportEvidenceBundle().unknowns).toEqual([]);
       });
     },
   );
@@ -504,6 +835,109 @@ describe("semantic query output failures through the public SDK", () => {
           },
         });
         expectUnexpectedToolFailure(response, failure);
+        expect(session.exportEvidenceBundle().records).toEqual([]);
+      });
+    },
+  );
+});
+
+describe("native matching failure ownership through the public SDK", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const matchingInput = () => ({
+    left: nativeMatchingInventory("1", [{ address: "0x10", value: "main" }]),
+    right: nativeMatchingInventory("2", [{ address: "0x20", value: "main" }]),
+    left_observations: nativeMatchingDetails("1", "0x10", "c3"),
+    right_observations: nativeMatchingDetails("2", "0x20", "c3"),
+    detail: "complete",
+  });
+
+  it.each(unexpectedResultFailures)(
+    "preserves an unexpected %s from native matching result validation",
+    async (_label, createFailure) => {
+      await withSdk(async ({ client, session }) => {
+        const input = matchingInput();
+        const failure = createFailure();
+        vi.spyOn(nativeFunctionMatchingSchema, "parse").mockImplementation(
+          () => {
+            throw failure;
+          },
+        );
+        const response = await client.callTool({
+          name: "match_native_functions",
+          arguments: input,
+        });
+        expectUnexpectedToolFailure(response, failure);
+        expect(session.exportEvidenceBundle().records).toEqual([]);
+      });
+    },
+  );
+
+  it.each(unexpectedResultFailures)(
+    "preserves an unexpected %s from native byte fingerprint derivation",
+    async (_label, createFailure) => {
+      await withSdk(async ({ client, session }) => {
+        const input = matchingInput();
+        const failure = createFailure();
+        vi.spyOn(
+          FunctionByteCoverage.prototype,
+          "fingerprint",
+        ).mockRejectedValue(failure);
+        const response = await client.callTool({
+          name: "match_native_functions",
+          arguments: input,
+        });
+        expectUnexpectedToolFailure(response, failure);
+        expect(session.exportEvidenceBundle().records).toEqual([]);
+      });
+    },
+  );
+});
+
+describe("compare_wasm_interfaces Evidence attribution", () => {
+  const inspection = (selectedPath?: string) => {
+    const report = wasmArtifactFixture();
+    return createEvidence(
+      {
+        path: report.artifact.path,
+        sha256: report.artifact.sha256,
+        format: "file",
+      },
+      { id: "typed-fixture", name: "Typed fixture", version: "1" },
+      {
+        operation: "inspect_wasm_artifact",
+        parameters: { path: selectedPath ?? report.artifact.path },
+        result: report,
+        confidence: "observed",
+      },
+    );
+  };
+
+  it.each(["left", "right"] as const)(
+    "names the %s argument whose authentic Evidence selects another artifact",
+    async (side) => {
+      await withSdk(async ({ client, session }) => {
+        const rejected = inspection("/artifacts/other.wasm");
+        const response = await client.callTool({
+          name: "compare_wasm_interfaces",
+          arguments: {
+            left: side === "left" ? rejected : inspection(),
+            right: side === "right" ? rejected : inspection(),
+            scope: "both",
+          },
+        });
+
+        expect(parseMcpToolError(response).error).toMatchObject({
+          code: "invalid_request",
+          details: {
+            issues: [
+              expect.objectContaining({
+                path: [side],
+                reason: "invalid_value",
+              }),
+            ],
+          },
+        });
         expect(session.exportEvidenceBundle().records).toEqual([]);
       });
     },

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isRecord } from "../kernel/isRecord.js";
 
 /** Artifact source declarations do not require generated-position decoding. */
 type SourceMapRecord = Readonly<Record<string, unknown>>;
@@ -53,9 +54,6 @@ export const sourceMapJsonText = (text: string): string => {
   return newline === -1 ? "" : withoutBom.slice(newline);
 };
 
-const isRecord = (value: unknown): value is SourceMapRecord =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
-
 /** Classify section ownership once; an external URL takes precedence over map. */
 export const classifySourceMapSection = (
   section: unknown,
@@ -77,6 +75,11 @@ export const classifySourceMapSection = (
       kind: "invalid",
       reason:
         "Indexed source-map section requires an embedded map or external URL.",
+    };
+  if (!isVersion3Map(section.map))
+    return {
+      kind: "invalid",
+      reason: "Indexed source-map section map is not a version 3 map.",
     };
   return { kind: "embedded", map: section.map };
 };
@@ -169,11 +172,6 @@ export const inspectSourceMapEnvelope = (root: unknown): SourceMapEnvelope => {
           externalSections.push({ path, url: classification.url });
         else if (classification.kind === "invalid")
           invalidSections.push({ path, reason: classification.reason });
-        else if (!isVersion3Map(classification.map))
-          invalidSections.push({
-            path,
-            reason: "Indexed source-map section map is not a version 3 map.",
-          });
         else children.push({ map: classification.map, path });
       }
       for (let index = children.length - 1; index >= 0; index -= 1) {
